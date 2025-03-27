@@ -356,11 +356,16 @@ func (e *endpoint) handleICMP(pkt *stack.PacketBuffer) {
 		replyData := stack.PayloadSince(pkt.TransportHeader())
 		defer replyData.Release()
 		ipHdr := header.IPv4(pkt.NetworkHeader().Slice())
+		localAddressTemporary := pkt.NetworkPacketInfo.LocalAddressTemporary
 		localAddressBroadcast := pkt.NetworkPacketInfo.LocalAddressBroadcast
 
 		// It's possible that a raw socket expects to receive this.
 		e.dispatcher.DeliverTransportPacket(header.ICMPv4ProtocolNumber, pkt)
 		pkt = nil
+
+		if localAddressTemporary {
+			return
+		}
 
 		sent := e.stats.icmp.packetsSent
 		if !e.protocol.allowICMPReply(header.ICMPv4EchoReply, header.ICMPv4UnusedCode) {

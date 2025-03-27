@@ -58,6 +58,8 @@ type NetworkPacketInfo struct {
 	// address.
 	LocalAddressBroadcast bool
 
+	LocalAddressTemporary bool
+
 	// IsForwardedPacket is true if the packet is being forwarded.
 	IsForwardedPacket bool
 }
