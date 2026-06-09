@@ -79,16 +79,7 @@ func (*protocol) ParsePorts(v []byte) (src, dst uint16, err tcpip.Error) {
 // HandleUnknownDestinationPacket handles packets that are targeted at this
 // protocol but don't match any existing endpoint.
 func (p *protocol) HandleUnknownDestinationPacket(id stack.TransportEndpointID, pkt *stack.PacketBuffer) stack.UnknownDestinationPacketDisposition {
-	hdr := header.UDP(pkt.TransportHeader().Slice())
-	netHdr := pkt.Network()
-	lengthValid, csumValid := header.UDPValid(
-		hdr,
-		func() uint16 { return pkt.Data().Checksum() },
-		uint16(pkt.Data().Size()),
-		pkt.NetworkProtocolNumber,
-		netHdr.SourceAddress(),
-		netHdr.DestinationAddress(),
-		pkt.RXChecksumValidated)
+	lengthValid, csumValid := validateDatagram(pkt)
 	if !lengthValid {
 		p.stack.Stats().UDP.MalformedPacketsReceived.Increment()
 		return stack.UnknownDestinationPacketMalformed
@@ -100,6 +91,19 @@ func (p *protocol) HandleUnknownDestinationPacket(id stack.TransportEndpointID, 
 	}
 
 	return stack.UnknownDestinationPacketUnhandled
+}
+
+func validateDatagram(pkt *stack.PacketBuffer) (lengthValid, csumValid bool) {
+	hdr := header.UDP(pkt.TransportHeader().Slice())
+	netHdr := pkt.Network()
+	return header.UDPValid(
+		hdr,
+		func() uint16 { return pkt.Data().Checksum() },
+		uint16(pkt.Data().Size()),
+		pkt.NetworkProtocolNumber,
+		netHdr.SourceAddress(),
+		netHdr.DestinationAddress(),
+		pkt.RXChecksumValidated)
 }
 
 // SetOption implements stack.TransportProtocol.SetOption.

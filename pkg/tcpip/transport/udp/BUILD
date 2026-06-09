@@ -21,6 +21,7 @@ go_template_instance(
 go_library(
     name = "udp",
     srcs = [
+        "datagram_forwarder.go",
         "endpoint.go",
         "endpoint_state.go",
         "forwarder.go",

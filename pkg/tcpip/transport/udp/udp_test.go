@@ -22,6 +22,7 @@ import (
 	"math"
 	"math/rand"
 	"os"
+	"reflect"
 	"testing"
 
 	"gvisor.dev/gvisor/pkg/buffer"
@@ -66,6 +67,847 @@ func testRead(c *context.Context, flow context.TestFlow, checkers ...checker.Con
 	payload := newRandomPayload(arbitraryPayloadSize)
 	c.InjectPacket(flow.NetProto(), context.BuildUDPPacket(payload, flow, context.Incoming, testTOS, testTTL, false))
 	c.ReadFromEndpointExpectSuccess(payload, flow, checkers...)
+}
+
+func TestDatagramForwarderHandlePacket(t *testing.T) {
+	c := context.New(t, []stack.TransportProtocolFactory{udp.NewProtocol})
+	defer c.Cleanup()
+
+	flow := context.UnicastV4
+	h := flow.MakeHeader4Tuple(context.Incoming)
+	payload := []byte("hello datagram")
+	responsePayload := []byte("datagram response")
+	handled := make(chan struct{})
+
+	fwd := udp.NewDatagramForwarder(c.Stack, func(r *udp.DatagramRequest) bool {
+		defer close(handled)
+
+		if got, want := r.ID(), (stack.TransportEndpointID{
+			LocalPort:     h.Dst.Port,
+			LocalAddress:  h.Dst.Addr,
+			RemotePort:    h.Src.Port,
+			RemoteAddress: h.Src.Addr,
+		}); got != want {
+			t.Errorf("got ID() = %+v, want = %+v", got, want)
+		}
+		if got, want := r.NetworkProtocol(), flow.NetProto(); got != want {
+			t.Errorf("got NetworkProtocol() = %d, want = %d", got, want)
+		}
+		if got, want := r.Source(), (tcpip.FullAddress{
+			NIC:  context.NICID,
+			Addr: h.Src.Addr,
+			Port: h.Src.Port,
+		}); got != want {
+			t.Errorf("got Source() = %+v, want = %+v", got, want)
+		}
+		if got, want := r.Destination(), (tcpip.FullAddress{
+			NIC:  context.NICID,
+			Addr: h.Dst.Addr,
+			Port: h.Dst.Port,
+		}); got != want {
+			t.Errorf("got Destination() = %+v, want = %+v", got, want)
+		}
+		if got := r.Payload(); !bytes.Equal(got, payload) {
+			t.Errorf("got Payload() = %q, want = %q", got, payload)
+		}
+
+		if err := r.WriteDatagram(udp.WriteDatagramOptions{
+			Source:      r.Destination(),
+			Destination: r.Source(),
+		}, responsePayload); err != nil {
+			t.Errorf("WriteDatagram() failed: %s", err)
+		}
+		return true
+	})
+	c.Stack.SetTransportProtocolHandler(udp.ProtocolNumber, fwd.HandlePacket)
+
+	c.InjectPacket(flow.NetProto(), context.BuildUDPPacket(payload, flow, context.Incoming, testTOS, testTTL, false))
+	<-handled
+
+	p := c.LinkEP.Read()
+	if p == nil {
+		t.Fatal("expected outbound UDP packet")
+	}
+	defer p.DecRef()
+
+	if got, want := p.NetworkProtocolNumber, flow.NetProto(); got != want {
+		t.Fatalf("got p.NetworkProtocolNumber = %d, want = %d", got, want)
+	}
+	if got, want := p.TransportProtocolNumber, header.UDPProtocolNumber; got != want {
+		t.Fatalf("got p.TransportProtocolNumber = %d, want = %d", got, want)
+	}
+
+	v := p.ToView()
+	defer v.Release()
+	checker.IPv4(t, v,
+		checker.SrcAddr(h.Dst.Addr),
+		checker.DstAddr(h.Src.Addr),
+		checker.UDP(
+			checker.SrcPort(h.Dst.Port),
+			checker.DstPort(h.Src.Port),
+			checker.Payload(responsePayload),
+		),
+	)
+}
+
+func TestDatagramForwarderPayloadReturnsCopy(t *testing.T) {
+	c := context.New(t, []stack.TransportProtocolFactory{udp.NewProtocol})
+	defer c.Cleanup()
+
+	flow := context.UnicastV4
+	payload := []byte("immutable datagram")
+	handled := make(chan struct{})
+
+	fwd := udp.NewDatagramForwarder(c.Stack, func(r *udp.DatagramRequest) bool {
+		defer close(handled)
+
+		first := r.Payload()
+		first[0] ^= 0xff
+
+		if got := r.Payload(); !bytes.Equal(got, payload) {
+			t.Errorf("got Payload() after mutating a prior copy = %q, want = %q", got, payload)
+		}
+		return true
+	})
+	c.Stack.SetTransportProtocolHandler(udp.ProtocolNumber, fwd.HandlePacket)
+
+	c.InjectPacket(flow.NetProto(), context.BuildUDPPacket(payload, flow, context.Incoming, testTOS, testTTL, false))
+	<-handled
+}
+
+func TestDatagramForwarderDoesNotInterceptExistingEndpoint(t *testing.T) {
+	c := context.New(t, []stack.TransportProtocolFactory{udp.NewProtocol})
+	defer c.Cleanup()
+
+	flow := context.UnicastV4
+	c.CreateEndpointForFlow(flow, udp.ProtocolNumber)
+	h := flow.MakeHeader4Tuple(context.Incoming)
+	if err := c.EP.Bind(tcpip.FullAddress{Addr: h.Dst.Addr, Port: h.Dst.Port}); err != nil {
+		t.Fatalf("Bind(%s:%d) failed: %s", h.Dst.Addr, h.Dst.Port, err)
+	}
+
+	handlerCalled := false
+	fwd := udp.NewDatagramForwarder(c.Stack, func(r *udp.DatagramRequest) bool {
+		handlerCalled = true
+		return true
+	})
+	c.Stack.SetTransportProtocolHandler(udp.ProtocolNumber, fwd.HandlePacket)
+
+	testRead(c, flow)
+	if handlerCalled {
+		t.Fatal("DatagramForwarder handled a packet that matched an existing endpoint")
+	}
+}
+
+func TestDatagramForwarderUnhandledPacketUsesUnknownDestinationHandling(t *testing.T) {
+	c := context.New(t, []stack.TransportProtocolFactory{udp.NewProtocol, icmp.NewProtocol6, icmp.NewProtocol4})
+	defer c.Cleanup()
+
+	flow := context.UnicastV4
+	payload := []byte("unhandled datagram")
+	handled := make(chan struct{})
+
+	fwd := udp.NewDatagramForwarder(c.Stack, func(r *udp.DatagramRequest) bool {
+		defer close(handled)
+		return false
+	})
+	c.Stack.SetTransportProtocolHandler(udp.ProtocolNumber, fwd.HandlePacket)
+
+	c.InjectPacket(flow.NetProto(), context.BuildUDPPacket(payload, flow, context.Incoming, testTOS, testTTL, false))
+	<-handled
+
+	p := c.LinkEP.Read()
+	if p == nil {
+		t.Fatal("expected ICMP port unreachable packet")
+	}
+	defer p.DecRef()
+
+	v := p.ToView()
+	defer v.Release()
+	checker.IPv4(t, v, checker.ICMPv4(
+		checker.ICMPv4Type(header.ICMPv4DstUnreachable),
+		checker.ICMPv4Code(header.ICMPv4PortUnreachable)))
+}
+
+func TestDatagramForwarderRejectsInvalidPackets(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		netProto        tcpip.NetworkProtocolNumber
+		packet          func() []byte
+		wantMalformed   uint64
+		wantMalformedL4 uint64
+		wantChecksum    uint64
+		wantHandlerHit  bool
+	}{
+		{
+			name:     "bad_checksum",
+			netProto: ipv4.ProtocolNumber,
+			packet: func() []byte {
+				return context.BuildUDPPacket([]byte("bad checksum"), context.UnicastV4, context.Incoming, testTOS, testTTL, true)
+			},
+			wantChecksum: 1,
+		},
+		{
+			name:     "bad_length",
+			netProto: ipv6.ProtocolNumber,
+			packet: func() []byte {
+				payload := []byte("bad length")
+				h := context.UnicastV6.MakeHeader4Tuple(context.Incoming)
+				pkt := context.BuildV6UDPPacket(payload, h, testTOS, testTTL, false)
+				u := header.UDP(pkt[header.IPv6MinimumSize:])
+				u.SetLength(u.Length() + 1)
+				return pkt
+			},
+			wantMalformed:   1,
+			wantMalformedL4: 1,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := context.New(t, []stack.TransportProtocolFactory{udp.NewProtocol, icmp.NewProtocol6, icmp.NewProtocol4})
+			defer c.Cleanup()
+
+			handlerCalled := false
+			fwd := udp.NewDatagramForwarder(c.Stack, func(r *udp.DatagramRequest) bool {
+				handlerCalled = true
+				return true
+			})
+			c.Stack.SetTransportProtocolHandler(udp.ProtocolNumber, fwd.HandlePacket)
+
+			c.InjectPacket(tc.netProto, tc.packet())
+			if handlerCalled != tc.wantHandlerHit {
+				t.Fatalf("got handlerCalled = %t, want = %t", handlerCalled, tc.wantHandlerHit)
+			}
+			if got := c.Stack.Stats().UDP.MalformedPacketsReceived.Value(); got != tc.wantMalformed {
+				t.Errorf("got stats.UDP.MalformedPacketsReceived.Value() = %d, want = %d", got, tc.wantMalformed)
+			}
+			if got := c.Stack.Stats().NICs.MalformedL4RcvdPackets.Value(); got != tc.wantMalformedL4 {
+				t.Errorf("got stats.NICs.MalformedL4RcvdPackets.Value() = %d, want = %d", got, tc.wantMalformedL4)
+			}
+			if got := c.Stack.Stats().UDP.ChecksumErrors.Value(); got != tc.wantChecksum {
+				t.Errorf("got stats.UDP.ChecksumErrors.Value() = %d, want = %d", got, tc.wantChecksum)
+			}
+			if p := c.LinkEP.Read(); p != nil {
+				defer p.DecRef()
+				t.Fatalf("unexpected outbound packet: %+v", p)
+			}
+		})
+	}
+}
+
+func TestDatagramForwarderChecksumZero(t *testing.T) {
+	for _, tc := range []struct {
+		name              string
+		netProto          tcpip.NetworkProtocolNumber
+		packet            func([]byte) []byte
+		transportHdrStart int
+		wantHandlerHit    bool
+		wantChecksum      uint64
+	}{
+		{
+			name:     "IPv4",
+			netProto: ipv4.ProtocolNumber,
+			packet: func(payload []byte) []byte {
+				return context.BuildV4UDPPacket(payload, context.UnicastV4.MakeHeader4Tuple(context.Incoming), testTOS, testTTL, false)
+			},
+			transportHdrStart: header.IPv4MinimumSize,
+			wantHandlerHit:    true,
+		},
+		{
+			name:     "IPv6",
+			netProto: ipv6.ProtocolNumber,
+			packet: func(payload []byte) []byte {
+				return context.BuildV6UDPPacket(payload, context.UnicastV6.MakeHeader4Tuple(context.Incoming), testTOS, testTTL, false)
+			},
+			transportHdrStart: header.IPv6MinimumSize,
+			wantChecksum:      1,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := context.New(t, []stack.TransportProtocolFactory{udp.NewProtocol})
+			defer c.Cleanup()
+
+			payload := []byte("checksum zero")
+			handlerCalled := false
+			fwd := udp.NewDatagramForwarder(c.Stack, func(r *udp.DatagramRequest) bool {
+				handlerCalled = true
+				if got := r.Payload(); !bytes.Equal(got, payload) {
+					t.Errorf("got Payload() = %q, want = %q", got, payload)
+				}
+				return true
+			})
+			c.Stack.SetTransportProtocolHandler(udp.ProtocolNumber, fwd.HandlePacket)
+
+			pkt := tc.packet(payload)
+			header.UDP(pkt[tc.transportHdrStart:]).SetChecksum(0)
+			c.InjectPacket(tc.netProto, pkt)
+
+			if handlerCalled != tc.wantHandlerHit {
+				t.Fatalf("got handlerCalled = %t, want = %t", handlerCalled, tc.wantHandlerHit)
+			}
+			if got := c.Stack.Stats().UDP.ChecksumErrors.Value(); got != tc.wantChecksum {
+				t.Errorf("got stats.UDP.ChecksumErrors.Value() = %d, want = %d", got, tc.wantChecksum)
+			}
+		})
+	}
+}
+
+func TestDatagramForwarderPayloadUsesUDPLength(t *testing.T) {
+	c := context.New(t, []stack.TransportProtocolFactory{udp.NewProtocol})
+	defer c.Cleanup()
+
+	payload := []byte("udp payload")
+	trailingBytes := []byte(" trailing bytes")
+	handlerCalled := false
+	fwd := udp.NewDatagramForwarder(c.Stack, func(r *udp.DatagramRequest) bool {
+		handlerCalled = true
+		if got := r.Payload(); !bytes.Equal(got, payload) {
+			t.Errorf("got Payload() = %q, want = %q", got, payload)
+		}
+		return true
+	})
+	c.Stack.SetTransportProtocolHandler(udp.ProtocolNumber, fwd.HandlePacket)
+
+	pkt := context.BuildV4UDPPacket(append(append([]byte(nil), payload...), trailingBytes...), context.UnicastV4.MakeHeader4Tuple(context.Incoming), testTOS, testTTL, false)
+	udpHeader := header.UDP(pkt[header.IPv4MinimumSize:])
+	udpHeader.SetLength(uint16(header.UDPMinimumSize + len(payload)))
+	udpHeader.SetChecksum(0)
+	c.InjectPacket(ipv4.ProtocolNumber, pkt)
+
+	if !handlerCalled {
+		t.Fatal("DatagramForwarder did not handle packet")
+	}
+}
+
+func TestDatagramForwarderWriteDatagramWithNonLocalSourceRequiresSpoofing(t *testing.T) {
+	fakeSrcAddr := tcpip.AddrFromSlice([]byte("\x0a\x00\x00\x63"))
+
+	for _, spoofing := range []bool{false, true} {
+		t.Run(fmt.Sprintf("spoofing=%t", spoofing), func(t *testing.T) {
+			c := context.New(t, []stack.TransportProtocolFactory{udp.NewProtocol})
+			defer c.Cleanup()
+
+			if spoofing {
+				if err := c.Stack.SetSpoofing(context.NICID, true); err != nil {
+					t.Fatalf("SetSpoofing(%d, true) failed: %s", context.NICID, err)
+				}
+			}
+
+			flow := context.UnicastV4
+			h := flow.MakeHeader4Tuple(context.Incoming)
+			payload := []byte("hello")
+			responsePayload := []byte("spoofed response")
+			handled := make(chan struct{})
+			var writeErr tcpip.Error
+
+			fwd := udp.NewDatagramForwarder(c.Stack, func(r *udp.DatagramRequest) bool {
+				defer close(handled)
+				fakeSrc := r.Destination()
+				fakeSrc.Addr = fakeSrcAddr
+				writeErr = r.WriteDatagram(udp.WriteDatagramOptions{
+					Source:      fakeSrc,
+					Destination: r.Source(),
+				}, responsePayload)
+				return true
+			})
+			c.Stack.SetTransportProtocolHandler(udp.ProtocolNumber, fwd.HandlePacket)
+
+			c.InjectPacket(flow.NetProto(), context.BuildUDPPacket(payload, flow, context.Incoming, testTOS, testTTL, false))
+			<-handled
+
+			p := c.LinkEP.Read()
+			if !spoofing {
+				if writeErr == nil {
+					t.Fatal("WriteDatagram with a non-local source succeeded with spoofing disabled")
+				}
+				if p != nil {
+					defer p.DecRef()
+					t.Fatalf("unexpected outbound packet with spoofing disabled: %+v", p)
+				}
+				return
+			}
+
+			if writeErr != nil {
+				t.Fatalf("WriteDatagram with a non-local source failed with spoofing enabled: %s", writeErr)
+			}
+			if p == nil {
+				t.Fatal("expected outbound packet with spoofing enabled")
+			}
+			defer p.DecRef()
+
+			v := p.ToView()
+			defer v.Release()
+			checker.IPv4(t, v,
+				checker.SrcAddr(fakeSrcAddr),
+				checker.DstAddr(h.Src.Addr),
+				checker.UDP(
+					checker.SrcPort(h.Dst.Port),
+					checker.DstPort(h.Src.Port),
+					checker.Payload(responsePayload),
+				),
+			)
+		})
+	}
+}
+
+func TestDatagramForwarderWriteDatagramIPv6(t *testing.T) {
+	c := context.New(t, []stack.TransportProtocolFactory{udp.NewProtocol})
+	defer c.Cleanup()
+
+	flow := context.UnicastV6
+	h := flow.MakeHeader4Tuple(context.Incoming)
+	payload := []byte("hello ipv6")
+	responsePayload := []byte("ipv6 response")
+	handled := make(chan struct{})
+
+	fwd := udp.NewDatagramForwarder(c.Stack, func(r *udp.DatagramRequest) bool {
+		defer close(handled)
+		if err := r.WriteDatagram(udp.WriteDatagramOptions{
+			Source:      r.Destination(),
+			Destination: r.Source(),
+		}, responsePayload); err != nil {
+			t.Errorf("WriteDatagram() failed: %s", err)
+		}
+		return true
+	})
+	c.Stack.SetTransportProtocolHandler(udp.ProtocolNumber, fwd.HandlePacket)
+
+	c.InjectPacket(flow.NetProto(), context.BuildUDPPacket(payload, flow, context.Incoming, testTOS, testTTL, false))
+	<-handled
+
+	checkNextIPv6UDPPacket(t, c, h.Dst, h.Src, responsePayload)
+}
+
+func TestWriteDatagram(t *testing.T) {
+	c := context.New(t, []stack.TransportProtocolFactory{udp.NewProtocol})
+	defer c.Cleanup()
+
+	flow := context.UnicastV4
+	h := flow.MakeHeader4Tuple(context.Outgoing)
+	payload := []byte("standalone write")
+
+	if err := udp.WriteDatagram(c.Stack, udp.WriteDatagramOptions{
+		NetProto:    flow.NetProto(),
+		NIC:         context.NICID,
+		Source:      tcpip.FullAddress{NIC: context.NICID, Addr: h.Src.Addr, Port: h.Src.Port},
+		Destination: tcpip.FullAddress{NIC: context.NICID, Addr: h.Dst.Addr, Port: h.Dst.Port},
+	}, payload); err != nil {
+		t.Fatalf("WriteDatagram() failed: %s", err)
+	}
+
+	checkNextUDPPacket(t, c, h.Src, h.Dst, payload)
+}
+
+func TestWriteDatagramDoesNotUseSourceNICForRouteSelection(t *testing.T) {
+	c := context.New(t, []stack.TransportProtocolFactory{udp.NewProtocol})
+	defer c.Cleanup()
+
+	payload := []byte("source nic ignored")
+	source := tcpip.FullAddress{NIC: context.NICID + 1, Addr: context.StackAddr, Port: context.StackPort}
+	destination := tcpip.FullAddress{Addr: context.TestAddr, Port: context.TestPort}
+
+	if err := udp.WriteDatagram(c.Stack, udp.WriteDatagramOptions{
+		NetProto:    ipv4.ProtocolNumber,
+		Source:      source,
+		Destination: destination,
+	}, payload); err != nil {
+		t.Fatalf("WriteDatagram() failed: %s", err)
+	}
+
+	source.NIC = 0
+	checkNextUDPPacket(t, c, source, destination, payload)
+}
+
+func TestWriteDatagramRouteSelectionNICPrecedence(t *testing.T) {
+	c := context.New(t, []stack.TransportProtocolFactory{udp.NewProtocol})
+	defer c.Cleanup()
+
+	nic2, nic2EP, nic2Addr, nic2Remote := addV4NIC2(t, c)
+	for _, tc := range []struct {
+		name     string
+		opts     udp.WriteDatagramOptions
+		wantEP   *channel.Endpoint
+		wantSrc  tcpip.FullAddress
+		wantDst  tcpip.FullAddress
+		wantIdle *channel.Endpoint
+	}{
+		{
+			name: "destination NIC fallback",
+			opts: udp.WriteDatagramOptions{
+				NetProto:    ipv4.ProtocolNumber,
+				Source:      tcpip.FullAddress{Addr: nic2Addr, Port: context.StackPort},
+				Destination: tcpip.FullAddress{NIC: nic2, Addr: nic2Remote, Port: context.TestPort},
+			},
+			wantEP:   nic2EP,
+			wantSrc:  tcpip.FullAddress{Addr: nic2Addr, Port: context.StackPort},
+			wantDst:  tcpip.FullAddress{NIC: nic2, Addr: nic2Remote, Port: context.TestPort},
+			wantIdle: c.LinkEP,
+		},
+		{
+			name: "explicit NIC takes precedence",
+			opts: udp.WriteDatagramOptions{
+				NetProto:    ipv4.ProtocolNumber,
+				NIC:         context.NICID,
+				Source:      tcpip.FullAddress{Addr: context.StackAddr, Port: context.StackPort},
+				Destination: tcpip.FullAddress{NIC: nic2, Addr: context.TestAddr, Port: context.TestPort},
+			},
+			wantEP:   c.LinkEP,
+			wantSrc:  tcpip.FullAddress{Addr: context.StackAddr, Port: context.StackPort},
+			wantDst:  tcpip.FullAddress{NIC: nic2, Addr: context.TestAddr, Port: context.TestPort},
+			wantIdle: nic2EP,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			payload := []byte(tc.name)
+			if err := udp.WriteDatagram(c.Stack, tc.opts, payload); err != nil {
+				t.Fatalf("WriteDatagram() failed: %s", err)
+			}
+			checkNextUDPPacketFromEndpoint(t, tc.wantEP, tc.wantSrc, tc.wantDst, payload)
+			if p := tc.wantIdle.Read(); p != nil {
+				defer p.DecRef()
+				t.Fatalf("unexpected packet on idle endpoint: %+v", p)
+			}
+		})
+	}
+}
+
+func TestDatagramRequestWriteDatagramUsesDestinationNICForRouteSelection(t *testing.T) {
+	c := context.New(t, []stack.TransportProtocolFactory{udp.NewProtocol})
+	defer c.Cleanup()
+
+	nic2, nic2EP, nic2Addr, nic2Remote := addV4NIC2(t, c)
+	responsePayload := []byte("response on nic2")
+	handlerCalled := false
+	fwd := udp.NewDatagramForwarder(c.Stack, func(r *udp.DatagramRequest) bool {
+		handlerCalled = true
+		if err := r.WriteDatagram(udp.WriteDatagramOptions{
+			Source:      tcpip.FullAddress{Addr: nic2Addr, Port: context.StackPort},
+			Destination: tcpip.FullAddress{NIC: nic2, Addr: nic2Remote, Port: context.TestPort},
+		}, responsePayload); err != nil {
+			t.Errorf("WriteDatagram() failed: %s", err)
+		}
+		return true
+	})
+	c.Stack.SetTransportProtocolHandler(udp.ProtocolNumber, fwd.HandlePacket)
+
+	c.InjectPacket(ipv4.ProtocolNumber, context.BuildUDPPacket([]byte("incoming"), context.UnicastV4, context.Incoming, testTOS, testTTL, false))
+	if !handlerCalled {
+		t.Fatal("DatagramForwarder did not handle packet")
+	}
+
+	checkNextUDPPacketFromEndpoint(t, nic2EP,
+		tcpip.FullAddress{Addr: nic2Addr, Port: context.StackPort},
+		tcpip.FullAddress{NIC: nic2, Addr: nic2Remote, Port: context.TestPort},
+		responsePayload)
+	if p := c.LinkEP.Read(); p != nil {
+		defer p.DecRef()
+		t.Fatalf("unexpected packet on ingress endpoint: %+v", p)
+	}
+}
+
+func TestWriteDatagramErrors(t *testing.T) {
+	c := context.New(t, []stack.TransportProtocolFactory{udp.NewProtocol})
+	defer c.Cleanup()
+
+	validOpts := udp.WriteDatagramOptions{
+		NetProto:    ipv4.ProtocolNumber,
+		NIC:         context.NICID,
+		Source:      tcpip.FullAddress{NIC: context.NICID, Addr: context.StackAddr, Port: context.StackPort},
+		Destination: tcpip.FullAddress{NIC: context.NICID, Addr: context.TestAddr, Port: context.TestPort},
+	}
+
+	for _, tc := range []struct {
+		name        string
+		opts        udp.WriteDatagramOptions
+		payload     []byte
+		wantErr     tcpip.Error
+		wantFailure bool
+	}{
+		{
+			name:    "missing_network_protocol",
+			opts:    udp.WriteDatagramOptions{NIC: validOpts.NIC, Source: validOpts.Source, Destination: validOpts.Destination},
+			payload: []byte("payload"),
+			wantErr: &tcpip.ErrInvalidEndpointState{},
+		},
+		{
+			name: "missing_source_address",
+			opts: udp.WriteDatagramOptions{
+				NetProto:    validOpts.NetProto,
+				NIC:         validOpts.NIC,
+				Source:      tcpip.FullAddress{NIC: context.NICID, Port: context.StackPort},
+				Destination: validOpts.Destination,
+			},
+			payload: []byte("payload"),
+			wantErr: &tcpip.ErrInvalidEndpointState{},
+		},
+		{
+			name: "missing_source_port",
+			opts: udp.WriteDatagramOptions{
+				NetProto:    validOpts.NetProto,
+				NIC:         validOpts.NIC,
+				Source:      tcpip.FullAddress{NIC: context.NICID, Addr: context.StackAddr},
+				Destination: validOpts.Destination,
+			},
+			payload: []byte("payload"),
+			wantErr: &tcpip.ErrInvalidEndpointState{},
+		},
+		{
+			name: "missing_destination_address",
+			opts: udp.WriteDatagramOptions{
+				NetProto:    validOpts.NetProto,
+				NIC:         validOpts.NIC,
+				Source:      validOpts.Source,
+				Destination: tcpip.FullAddress{NIC: context.NICID, Port: context.TestPort},
+			},
+			payload: []byte("payload"),
+			wantErr: &tcpip.ErrInvalidEndpointState{},
+		},
+		{
+			name:    "payload_too_large",
+			opts:    validOpts,
+			payload: make([]byte, header.UDPMaximumPacketSize-header.UDPMinimumSize+1),
+			wantErr: &tcpip.ErrMessageTooLong{},
+		},
+		{
+			name: "non_local_source_without_spoofing",
+			opts: udp.WriteDatagramOptions{
+				NetProto:    validOpts.NetProto,
+				NIC:         validOpts.NIC,
+				Source:      tcpip.FullAddress{NIC: context.NICID, Addr: tcpip.AddrFromSlice([]byte("\x0a\x00\x00\x63")), Port: context.StackPort},
+				Destination: validOpts.Destination,
+			},
+			payload:     []byte("payload"),
+			wantFailure: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := udp.WriteDatagram(c.Stack, tc.opts, tc.payload)
+			if tc.wantFailure {
+				if err == nil {
+					t.Fatal("got nil error, want failure")
+				}
+			} else {
+				checkTCPIPError(t, err, tc.wantErr)
+			}
+			if p := c.LinkEP.Read(); p != nil {
+				defer p.DecRef()
+				t.Fatalf("unexpected outbound packet: %+v", p)
+			}
+		})
+	}
+}
+
+func TestDatagramForwarderSupportsEndpointIndependentPolicy(t *testing.T) {
+	c := context.New(t, []stack.TransportProtocolFactory{udp.NewProtocol})
+	defer c.Cleanup()
+
+	if err := c.Stack.SetSpoofing(context.NICID, true); err != nil {
+		t.Fatalf("SetSpoofing(%d, true) failed: %s", context.NICID, err)
+	}
+
+	public := tcpip.FullAddress{NIC: context.NICID, Addr: context.StackAddr, Port: 5555}
+	internal := tcpip.FullAddress{NIC: context.NICID, Addr: tcpip.AddrFromSlice([]byte("\x0a\x00\x00\x63")), Port: 1111}
+	remoteX := tcpip.FullAddress{NIC: context.NICID, Addr: context.TestAddr, Port: 2222}
+	remoteY := tcpip.FullAddress{NIC: context.NICID, Addr: tcpip.AddrFromSlice([]byte("\x0a\x00\x00\x03")), Port: 3333}
+	remoteZ := tcpip.FullAddress{NIC: context.NICID, Addr: tcpip.AddrFromSlice([]byte("\x0a\x00\x00\x04")), Port: 4444}
+
+	policy := testEndpointIndependentDatagramPolicy{
+		stack:    c.Stack,
+		netProto: ipv4.ProtocolNumber,
+		public:   public,
+		mapping:  make(map[tcpip.FullAddress]tcpip.FullAddress),
+	}
+
+	firstPayload := []byte("first outbound")
+	if err := policy.forwardOutbound(internal, remoteX, firstPayload); err != nil {
+		t.Fatalf("forwardOutbound(%+v, %+v) failed: %s", internal, remoteX, err)
+	}
+	checkNextUDPPacket(t, c, public, remoteX, firstPayload)
+
+	secondPayload := []byte("second outbound")
+	if err := policy.forwardOutbound(internal, remoteY, secondPayload); err != nil {
+		t.Fatalf("forwardOutbound(%+v, %+v) failed: %s", internal, remoteY, err)
+	}
+	checkNextUDPPacket(t, c, public, remoteY, secondPayload)
+
+	if got := policy.mapping[public]; got != internal {
+		t.Fatalf("got mapping[%+v] = %+v, want = %+v", public, got, internal)
+	}
+
+	handled := make(chan struct{})
+	fwd := udp.NewDatagramForwarder(c.Stack, func(r *udp.DatagramRequest) bool {
+		defer close(handled)
+		if err := policy.forwardInbound(r); err != nil {
+			t.Errorf("forwardInbound(%+v) failed: %s", r.ID(), err)
+		}
+		return true
+	})
+	c.Stack.SetTransportProtocolHandler(udp.ProtocolNumber, fwd.HandlePacket)
+
+	inboundPayload := []byte("inbound from new peer")
+	c.InjectPacket(ipv4.ProtocolNumber, context.BuildV4UDPPacket(inboundPayload, context.Header4Tuple{
+		Src: remoteZ,
+		Dst: public,
+	}, testTOS, testTTL, false))
+	<-handled
+
+	checkNextUDPPacket(t, c, remoteZ, internal, inboundPayload)
+}
+
+type testEndpointIndependentDatagramPolicy struct {
+	stack    *stack.Stack
+	netProto tcpip.NetworkProtocolNumber
+	public   tcpip.FullAddress
+	mapping  map[tcpip.FullAddress]tcpip.FullAddress
+}
+
+func (p *testEndpointIndependentDatagramPolicy) forwardOutbound(internal, remote tcpip.FullAddress, payload []byte) tcpip.Error {
+	if mapped, ok := p.mapping[p.public]; ok && mapped != internal {
+		return &tcpip.ErrPortInUse{}
+	}
+	p.mapping[p.public] = internal
+
+	return udp.WriteDatagram(p.stack, udp.WriteDatagramOptions{
+		NetProto:    p.netProto,
+		NIC:         context.NICID,
+		Source:      p.public,
+		Destination: remote,
+	}, payload)
+}
+
+func (p *testEndpointIndependentDatagramPolicy) forwardInbound(r *udp.DatagramRequest) tcpip.Error {
+	internal, ok := p.mapping[r.Destination()]
+	if !ok {
+		return &tcpip.ErrHostUnreachable{}
+	}
+	return r.WriteDatagram(udp.WriteDatagramOptions{
+		Source:      r.Source(),
+		Destination: internal,
+	}, r.Payload())
+}
+
+func checkNextUDPPacket(t *testing.T, c *context.Context, src, dst tcpip.FullAddress, payload []byte) {
+	t.Helper()
+
+	p := c.LinkEP.Read()
+	if p == nil {
+		t.Fatal("expected outbound UDP packet")
+	}
+	defer p.DecRef()
+
+	v := p.ToView()
+	defer v.Release()
+	checker.IPv4(t, v,
+		checker.SrcAddr(src.Addr),
+		checker.DstAddr(dst.Addr),
+		checker.UDP(
+			checker.SrcPort(src.Port),
+			checker.DstPort(dst.Port),
+			checker.Payload(payload),
+		),
+	)
+}
+
+func checkNextUDPPacketFromEndpoint(t *testing.T, ep *channel.Endpoint, src, dst tcpip.FullAddress, payload []byte) {
+	t.Helper()
+
+	p := ep.Read()
+	if p == nil {
+		t.Fatal("expected outbound UDP packet")
+	}
+	defer p.DecRef()
+
+	v := p.ToView()
+	defer v.Release()
+	checker.IPv4(t, v,
+		checker.SrcAddr(src.Addr),
+		checker.DstAddr(dst.Addr),
+		checker.UDP(
+			checker.SrcPort(src.Port),
+			checker.DstPort(dst.Port),
+			checker.Payload(payload),
+		),
+	)
+}
+
+func checkNextIPv6UDPPacket(t *testing.T, c *context.Context, src, dst tcpip.FullAddress, payload []byte) {
+	t.Helper()
+
+	p := c.LinkEP.Read()
+	if p == nil {
+		t.Fatal("expected outbound UDP packet")
+	}
+	defer p.DecRef()
+
+	v := p.ToView()
+	defer v.Release()
+	checker.IPv6(t, v,
+		checker.SrcAddr(src.Addr),
+		checker.DstAddr(dst.Addr),
+		checker.UDP(
+			checker.SrcPort(src.Port),
+			checker.DstPort(dst.Port),
+			checker.Payload(payload),
+		),
+	)
+}
+
+func addV4NIC2(t *testing.T, c *context.Context) (tcpip.NICID, *channel.Endpoint, tcpip.Address, tcpip.Address) {
+	t.Helper()
+
+	const nic2 = context.NICID + 1
+	nic2Addr := tcpip.AddrFromSlice([]byte("\x0a\x00\x01\x01"))
+	nic2Remote := tcpip.AddrFromSlice([]byte("\x0a\x00\x01\x02"))
+
+	ep := channel.New(256, context.DefaultMTU, "")
+	if err := c.Stack.CreateNIC(nic2, ep); err != nil {
+		ep.Close()
+		t.Fatalf("CreateNIC(%d, _): %s", nic2, err)
+	}
+	t.Cleanup(ep.Close)
+
+	protocolAddr := tcpip.ProtocolAddress{
+		Protocol:          ipv4.ProtocolNumber,
+		AddressWithPrefix: nic2Addr.WithPrefix(),
+	}
+	if err := c.Stack.AddProtocolAddress(nic2, protocolAddr, stack.AddressProperties{}); err != nil {
+		t.Fatalf("AddProtocolAddress(%d, %+v, {}): %s", nic2, protocolAddr, err)
+	}
+
+	nic1Subnet, err := tcpip.NewSubnet(tcpip.AddrFromSlice([]byte("\x0a\x00\x00\x00")), tcpip.MaskFrom("\xff\xff\xff\x00"))
+	if err != nil {
+		t.Fatalf("NewSubnet(_, _) failed: %s", err)
+	}
+	nic2Subnet, err := tcpip.NewSubnet(tcpip.AddrFromSlice([]byte("\x0a\x00\x01\x00")), tcpip.MaskFrom("\xff\xff\xff\x00"))
+	if err != nil {
+		t.Fatalf("NewSubnet(_, _) failed: %s", err)
+	}
+	c.Stack.SetRouteTable([]tcpip.Route{
+		{
+			Destination: nic1Subnet,
+			NIC:         context.NICID,
+		},
+		{
+			Destination: nic2Subnet,
+			NIC:         nic2,
+		},
+		{
+			Destination: header.IPv6EmptySubnet,
+			NIC:         context.NICID,
+		},
+	})
+
+	return nic2, ep, nic2Addr, nic2Remote
+}
+
+func checkTCPIPError(t *testing.T, got, want tcpip.Error) {
+	t.Helper()
+
+	if got == nil {
+		t.Fatalf("got nil error, want %s", want)
+	}
+	if reflect.TypeOf(got) != reflect.TypeOf(want) {
+		t.Fatalf("got error %s (%T), want %s (%T)", got, got, want, want)
+	}
 }
 
 func testFailingRead(c *context.Context, flow context.TestFlow, expectReadError bool) {
